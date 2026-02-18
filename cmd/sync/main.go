@@ -16,182 +16,127 @@ import (
 )
 
 func main() {
-	logger.Init()
+	fld := flag.String("folder", "", "path")
+	prt := flag.String("port", "9000", "port")
+	flg := flag.Parse
 
-	folder := flag.String("folder", "", "Folder path")
-	port := flag.String("port", "9000", "Listening port")
-	peer := flag.String("peer", "", "Peer address")
-
-	flag.Parse()
-
-	if *folder == "" {
-		logger.Error.Fatal("Folder path is required")
+	flg()
+	if *fld == "" {
+		logger.Err("Need -folder")
+		os.Exit(1)
 	}
 
-	address := ":" + *port
+	host, _ := os.Hostname()
+	id := fmt.Sprintf("%s-%s", host, *prt)
+	st := network.NewNetworkState()
 
-	// Get or generate DeviceID
-	hostname, _ := os.Hostname()
-	deviceID := fmt.Sprintf("%s-%s", hostname, *port)
-
-	state := network.NewNetworkState()
-
-	// Initial local index registration for voting
-	if local, err := indexer.ScanFolder(*folder); err == nil {
-		state.UpdatePeer(deviceID, local)
+	if idx, err := indexer.ScanFolder(*fld); err == nil {
+		st.Update(id, idx)
 	}
 
-	logger.Info.Printf("Starting Sync Service [%s] on port %s for folder: %s\n", deviceID, *port, *folder)
+	logger.Info("Starting %s on :%s", id, *prt)
+	go network.Start(*fld, ":"+*prt, id, st)
+	go network.Broadcast(*prt)
+	go network.Discover(id, func(a string) { network.Connect(*fld, a, id, st) })
 
-	go network.StartListener(*folder, address, deviceID, state)
-	go network.StartDiscoveryBroadcaster(*port)
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print(logger.G + logger.C)
+		if !scanner.Scan() {
+			break
+		}
 
-	logger.Info.Println("Starting automatic discovery...")
-	go network.DiscoverPeers(deviceID, func(peerAddr string) {
-		network.ConnectToPeer(*folder, peerAddr, deviceID, state)
-	})
+		p := strings.Fields(scanner.Text())
+		if len(p) == 0 {
+			continue
+		}
 
-	if *peer != "" {
-		network.ConnectToPeer(*folder, *peer, deviceID, state)
-	}
-
-	// Interactive Loop
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for {
-			fmt.Print("> ")
-			if !scanner.Scan() {
-				break
-			}
-			input := scanner.Text()
-			parts := strings.Fields(input)
-			if len(parts) == 0 {
+		switch p[0] {
+		case "status":
+			status(*fld, id, st)
+		case "sync":
+			if len(p) < 2 {
+				logger.Warn("sync [all|idx]")
 				continue
 			}
-
-			cmd := parts[0]
-			switch cmd {
-			case "status":
-				showStatus(*folder, deviceID, state)
-
-			case "sync":
-				if len(parts) < 2 {
-					fmt.Println("Usage: sync [all|idx]")
-					continue
+			files := st.GetGlobal()
+			if p[1] == "all" {
+				local, _ := indexer.ScanFolder(*fld)
+				lh := make(map[string]bool)
+				for _, f := range local {
+					lh[f.Hash] = true
 				}
-				files := state.GetGlobalFiles()
-				if parts[1] == "all" {
-					local, _ := indexer.ScanFolder(*folder)
-					localHashes := make(map[string]bool)
-					for _, f := range local {
-						localHashes[f.Hash] = true
-					}
-					for _, f := range files {
-						if !localHashes[f.Hash] {
-							network.BroadcastFileRequest(f.Hash, f.RelativePath)
-						}
-					}
-				} else if idx, err := strconv.Atoi(parts[1]); err == nil && idx >= 0 && idx < len(files) {
-					f := files[idx]
-					network.BroadcastFileRequest(f.Hash, f.RelativePath)
-				}
-
-			case "rename":
-				if len(parts) < 3 {
-					fmt.Println("Usage: rename [idx] [new_name]")
-					continue
-				}
-				idx, _ := strconv.Atoi(parts[1])
-				newName := parts[2]
-				files := state.GetGlobalFiles()
-				if idx >= 0 && idx < len(files) {
-					f := files[idx]
-					oldPath := filepath.Join(*folder, f.RelativePath)
-					newPath := filepath.Join(*folder, newName)
-
-					os.MkdirAll(filepath.Dir(newPath), os.ModePerm)
-					err := os.Rename(oldPath, newPath)
-					if err != nil {
-						fmt.Printf("Local rename failed: %v\n", err)
-					} else {
-						state.SetManualConsensus(f.Hash, newName)
-						network.BroadcastConsensusVote(f.Hash, newName)
-						fmt.Printf("Renamed locally and broadcast vote for %s -> %s\n", f.Hash[:8], newName)
-						showStatus(*folder, deviceID, state)
+				for _, f := range files {
+					if !lh[f.Hash] {
+						network.BroadcastReq(f.Hash, f.RelativePath)
 					}
 				}
-
-			case "vote":
-				if len(parts) < 3 {
-					fmt.Println("Usage: vote [idx] [new_name]")
-					continue
-				}
-				idx, _ := strconv.Atoi(parts[1])
-				name := parts[2]
-				files := state.GetGlobalFiles()
-				if idx >= 0 && idx < len(files) {
-					f := files[idx]
-					state.SetManualConsensus(f.Hash, name)
-					network.BroadcastConsensusVote(f.Hash, name)
-					fmt.Printf("Vote cast for %s -> %s\n", f.Hash[:8], name)
-					showStatus(*folder, deviceID, state)
-				}
-
-			case "help":
-				fmt.Println("Commands: status, sync [all|idx], rename [idx] [name], vote [idx] [name], exit")
-			case "exit":
-				os.Exit(0)
-			default:
-				fmt.Println("Unknown command. Type 'help' for available commands.")
+			} else if i, _ := strconv.Atoi(p[1]); i >= 0 && i < len(files) {
+				network.BroadcastReq(files[i].Hash, files[i].RelativePath)
 			}
+		case "rename":
+			if len(p) < 3 {
+				logger.Warn("rename [idx] [name]")
+				continue
+			}
+			i, _ := strconv.Atoi(p[1])
+			files := st.GetGlobal()
+			if i >= 0 && i < len(files) {
+				f := files[i]
+				oldP, newP := filepath.Join(*fld, f.RelativePath), filepath.Join(*fld, p[2])
+				os.MkdirAll(filepath.Dir(newP), os.ModePerm)
+				if err := os.Rename(oldP, newP); err == nil {
+					st.SetVote(f.Hash, p[2])
+					network.BroadcastVote(f.Hash, p[2])
+					logger.Done("Renamed: %s", p[2])
+					status(*fld, id, st)
+				} else {
+					logger.Err("Rename fail: %v", err)
+				}
+			}
+		case "exit":
+			os.Exit(0)
+		default:
+			logger.Warn("status, sync, rename, exit")
 		}
-	}()
+	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-	logger.Info.Println("Shutting down Sync Service...")
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM)
+	<-sc
 }
 
-func showStatus(folder, deviceID string, state *network.NetworkState) {
-	// Re-scan local and broadcast updated state
-	local, err := indexer.ScanFolder(folder)
-	if err == nil {
-		state.UpdatePeer(deviceID, local)
-		network.BroadcastIndex(folder, deviceID)
+func status(fld, id string, st *network.NetworkState) {
+	if l, err := indexer.ScanFolder(fld); err == nil {
+		st.Update(id, l)
+		network.BroadcastIdx(fld, id)
 	}
 
-	files := state.GetGlobalFiles() // Sorted alphabetically
-	localHashes := make(map[string]bool)
+	files := st.GetGlobal()
+	local, _ := indexer.ScanFolder(fld)
+	lh := make(map[string]bool)
 	for _, f := range local {
-		localHashes[f.Hash] = true
+		lh[f.Hash] = true
 	}
 
-	fmt.Printf("\n--- Global Network View ---\n")
-	var missing []indexer.FileMeta
+	fmt.Println(logger.Y + "\n--- Network ---" + logger.C)
 	for i, f := range files {
-		status := "OK"
-		if !localHashes[f.Hash] {
-			status = "MISSING"
-			missing = append(missing, f)
+		stat := logger.G + "OK" + logger.C
+		if !lh[f.Hash] {
+			stat = logger.R + "MISSING" + logger.C
 		}
 
-		collision := ""
-		if (i > 0 && files[i-1].RelativePath == f.RelativePath) ||
-			(i < len(files)-1 && files[i+1].RelativePath == f.RelativePath) {
-			collision = " [COLLISION]"
+		col := ""
+		if (i > 0 && files[i-1].RelativePath == f.RelativePath) || (i < len(files)-1 && files[i+1].RelativePath == f.RelativePath) {
+			col = logger.R + " [COLLISION]" + logger.C
 		}
 
-		_, ok := state.GetConsensusName(f.Hash)
-		consensusLabel := "Consensus"
-		if !ok {
-			consensusLabel = "TIE!"
+		lbl := logger.G + "Consensus" + logger.C
+		if _, ok := st.GetWinner(f.Hash); !ok {
+			lbl = logger.Y + "TIE!" + logger.C
 		}
 
-		fmt.Printf("[%d] %s (%s) - %s [%s]%s\n", i, f.RelativePath, f.Hash[:8], status, consensusLabel, collision)
+		fmt.Printf("[%d] %s (%s) - %s [%s]%s\n", i, f.RelativePath, f.Hash[:8], stat, lbl, col)
 	}
-
-	if len(missing) > 0 {
-		fmt.Printf("\nYou have %d missing files. Type 'sync all' or 'sync <index>' to download.\n", len(missing))
-	}
+	fmt.Println()
 }

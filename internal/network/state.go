@@ -6,129 +6,75 @@ import (
 	"sync/internal/indexer"
 )
 
-type FileVoter struct {
-	Names map[string]int // Name -> Count
-}
-
 type NetworkState struct {
-	mu           sync.RWMutex
-	Peers        map[string][]indexer.FileMeta // DeviceID -> List of files
-	GlobalCounts map[string]*FileVoter         // Hash -> Voter
-	ManualVotes  map[string]string             // Hash -> Manual Winner
+	mu sync.RWMutex
+	peers map[string][]indexer.FileMeta
+	votes map[string]string
 }
 
 func NewNetworkState() *NetworkState {
 	return &NetworkState{
-		Peers:        make(map[string][]indexer.FileMeta),
-		GlobalCounts: make(map[string]*FileVoter),
-		ManualVotes:  make(map[string]string),
+		peers: make(map[string][]indexer.FileMeta),
+		votes: make(map[string]string),
 	}
 }
 
-func (s *NetworkState) SetManualConsensus(hash, name string) {
+func (s *NetworkState) Update(id string, files []indexer.FileMeta) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.ManualVotes[hash] = name
+	s.peers[id] = files
 }
 
-func (s *NetworkState) UpdatePeer(deviceID string, files []indexer.FileMeta) {
+func (s *NetworkState) SetVote(h, n string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.Peers[deviceID] = files
-	s.recalculateConsensus()
+	s.votes[h] = n
 }
 
-func (s *NetworkState) recalculateConsensus() {
-	newCounts := make(map[string]*FileVoter)
+func (s *NetworkState) GetGlobal() []indexer.FileMeta {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	for _, files := range s.Peers {
+	m := make(map[string]indexer.FileMeta)
+	for _, files := range s.peers {
 		for _, f := range files {
-			voter, ok := newCounts[f.Hash]
-			if !ok {
-				voter = &FileVoter{Names: make(map[string]int)}
-				newCounts[f.Hash] = voter
-			}
-			voter.Names[f.RelativePath]++
+			m[f.Hash] = f
 		}
 	}
-	s.GlobalCounts = newCounts
+
+	var res []indexer.FileMeta
+	for _, f := range m {
+		res = append(res, f)
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].RelativePath < res[j].RelativePath })
+	return res
 }
 
-func (s *NetworkState) GetConsensusName(hash string) (string, bool) {
+func (s *NetworkState) GetWinner(h string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if name, ok := s.ManualVotes[hash]; ok {
-		return name, true
+	if v, ok := s.votes[h]; ok {
+		return v, true
 	}
 
-	voter, ok := s.GlobalCounts[hash]
-	if !ok {
-		return "", false
-	}
-
-	maxCount := -1
-	var winner string
-	isTie := false
-
-	for name, count := range voter.Names {
-		if count > maxCount {
-			maxCount = count
-			winner = name
-			isTie = false
-		} else if count == maxCount {
-			isTie = true
-		}
-	}
-
-	return winner, !isTie
-}
-
-func (s *NetworkState) GetGlobalFiles() []indexer.FileMeta {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var result []indexer.FileMeta
-	hashesSeen := make(map[string]bool)
-
-	for hash, voter := range s.GlobalCounts {
-		if hashesSeen[hash] {
-			continue
-		}
-
-		// Find best name
-		var bestName string
-		max := -1
-		for name, count := range voter.Names {
-			if count > max {
-				max = count
-				bestName = name
+	counts := make(map[string]int)
+	for _, files := range s.peers {
+		for _, f := range files {
+			if f.Hash == h {
+				counts[f.RelativePath]++
 			}
 		}
-
-		// Just need any file meta for this hash from any peer to get size/modtime
-		for _, peerFiles := range s.Peers {
-			for _, f := range peerFiles {
-				if f.Hash == hash {
-					result = append(result, indexer.FileMeta{
-						RelativePath: bestName,
-						Size:         f.Size,
-						ModTime:      f.ModTime,
-						Hash:         f.Hash,
-					})
-					hashesSeen[hash] = true
-					goto nextHash
-				}
-			}
-		}
-	nextHash:
 	}
 
-	// Sort results alphabetically by name
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].RelativePath < result[j].RelativePath
-	})
-
-	return result
+	max, winner := 0, ""
+	tie := false
+	for n, c := range counts {
+		if c > max {
+			max, winner, tie = c, n, false
+		} else if c == max {
+			tie = true
+		}
+	}
+	return winner, !tie && winner != ""
 }

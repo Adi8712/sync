@@ -11,256 +11,125 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
 	"sync/internal/indexer"
 	"sync/internal/logger"
 )
 
-func StartListener(folder string, address string, myDeviceID string, state *NetworkState) error {
-	cert, err := GenerateSelfSignedCert()
-	if err != nil {
-		return err
-	}
-	tlsConfig := GetTLSConfig(cert)
-
-	logger.Info.Println("Starting secure peer listener on", address)
-
-	listener, err := tls.Listen("tcp", address, tlsConfig)
-	if err != nil {
-		return err
-	}
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			logger.Error.Println("Accept failed:", err)
-			continue
-		}
-
-		logger.Info.Println("Incoming secure connection from", conn.RemoteAddr())
-		go handleConnection(conn, folder, myDeviceID, state)
-	}
-}
-
-func ConnectToPeer(folder string, address string, myDeviceID string, state *NetworkState) error {
-	cert, err := GenerateSelfSignedCert()
-	if err != nil {
-		return err
-	}
-	tlsConfig := GetTLSConfig(cert)
-
-	logger.Info.Println("Connecting securely to peer:", address)
-
-	conn, err := tls.Dial("tcp", address, tlsConfig)
-	if err != nil {
-		return err
-	}
-
-	go handleConnection(conn, folder, myDeviceID, state)
-	return nil
-}
-
 var (
 	connMu sync.Mutex
-	conns  = make(map[string]net.Conn) // DeviceID -> connection
+	conns  = make(map[string]net.Conn)
 )
 
-func registerConn(id string, conn net.Conn) {
-	connMu.Lock()
-	defer connMu.Unlock()
-	conns[id] = conn
-}
-
-func BroadcastFileRequest(hash, path string) {
-	connMu.Lock()
-	defer connMu.Unlock()
-
-	req, _ := json.Marshal(FileRequestMessage{
-		Type: "FILE_REQUEST",
-		Hash: hash,
-		Path: path,
-	})
-
-	for id, conn := range conns {
-		_, err := conn.Write(append(req, '\n'))
-		if err != nil {
-			logger.Error.Printf("Failed to request file from %s: %v\n", id, err)
-		}
-	}
-}
-
-func BroadcastIndex(folder string, myDeviceID string) {
-	localFiles, err := indexer.ScanFolder(folder)
-	if err != nil {
-		logger.Error.Println("Scan failed for broadcast:", err)
-		return
-	}
-
-	idxMsg, _ := json.Marshal(IndexMessage{
-		Type:     "INDEX",
-		DeviceID: myDeviceID,
-		Files:    localFiles,
-	})
-
-	connMu.Lock()
-	defer connMu.Unlock()
-	for _, conn := range conns {
-		conn.Write(append(idxMsg, '\n'))
-	}
-}
-
-func BroadcastConsensusVote(hash, name string) {
-	connMu.Lock()
-	defer connMu.Unlock()
-
-	vote, _ := json.Marshal(ConsensusVoteMessage{
-		Type: "CONSENSUS_VOTE",
-		Hash: hash,
-		Name: name,
-	})
-
-	for _, conn := range conns {
-		conn.Write(append(vote, '\n'))
-	}
-}
-
-func handleConnection(conn net.Conn, folder string, myDeviceID string, state *NetworkState) {
-	defer conn.Close()
-
-	// Immediately send our index
-	localFiles, err := indexer.ScanFolder(folder)
-	if err == nil {
-		idxMsg, _ := json.Marshal(IndexMessage{
-			Type:     "INDEX",
-			DeviceID: myDeviceID,
-			Files:    localFiles,
-		})
-		conn.Write(append(idxMsg, '\n'))
-	}
-
-	reader := bufio.NewReader(conn)
+func Start(fld, addr, id string, st *NetworkState) {
+	c, _ := GetCert()
+	l, _ := tls.Listen("tcp", addr, TLSConfig(c))
 	for {
-		line, err := reader.ReadBytes('\n')
+		conn, _ := l.Accept()
+		go handle(conn, fld, id, st)
+	}
+}
+
+func Connect(fld, addr, id string, st *NetworkState) {
+	c, _ := GetCert()
+	conn, _ := tls.Dial("tcp", addr, TLSConfig(c))
+	go handle(conn, fld, id, st)
+}
+
+func handle(conn net.Conn, fld, id string, st *NetworkState) {
+	defer conn.Close()
+	idx, _ := indexer.ScanFolder(fld)
+	b, _ := json.Marshal(IndexMsg{"INDEX", id, idx})
+	conn.Write(append(b, '\n'))
+
+	r := bufio.NewReader(conn)
+	for {
+		ln, err := r.ReadBytes('\n')
 		if err != nil {
-			if err != io.EOF {
-				logger.Error.Println("Connection error:", err)
-			}
 			return
 		}
 
-		var raw map[string]interface{}
-		if err := json.Unmarshal(line, &raw); err != nil {
-			continue
-		}
-
-		switch raw["type"] {
+		var m map[string]any
+		json.Unmarshal(ln, &m)
+		switch m["t"] {
 		case "INDEX":
-			var msg IndexMessage
-			if err := json.Unmarshal(line, &msg); err != nil {
-				continue
-			}
-			state.UpdatePeer(msg.DeviceID, msg.Files)
-			registerConn(msg.DeviceID, conn)
-			logger.Info.Printf("Updated state for peer: %s (%d files)\n", msg.DeviceID, len(msg.Files))
-
-		case "CONSENSUS_VOTE":
-			var msg ConsensusVoteMessage
-			if err := json.Unmarshal(line, &msg); err != nil {
-				continue
-			}
-			state.SetManualConsensus(msg.Hash, msg.Name)
-			logger.Info.Printf("Consensus vote received for %s: %s\n", msg.Hash[:8], msg.Name)
-
-		case "FILE_REQUEST":
-			var msg FileRequestMessage
-			if err := json.Unmarshal(line, &msg); err != nil {
-				continue
-			}
-			logger.Info.Printf("Peer requested file: %s (%s)\n", msg.Path, msg.Hash[:8])
-
-			// Find file by hash locally
-			localFiles, _ := indexer.ScanFolder(folder)
-			var found *indexer.FileMeta
-			for _, f := range localFiles {
+			var msg IndexMsg
+			json.Unmarshal(ln, &msg)
+			st.Update(msg.Device, msg.Files)
+			connMu.Lock()
+			conns[msg.Device] = conn
+			connMu.Unlock()
+		case "VOTE":
+			var msg VoteMsg
+			json.Unmarshal(ln, &msg)
+			st.SetVote(msg.Hash, msg.Name)
+		case "REQ":
+			var msg ReqMsg
+			json.Unmarshal(ln, &msg)
+			files, _ := indexer.ScanFolder(fld)
+			for _, f := range files {
 				if f.Hash == msg.Hash {
-					found = &f
+					sendFile(conn, fld, f)
 					break
 				}
 			}
-
-			if found != nil {
-				sendMissingFiles(conn, folder, []indexer.FileMeta{*found})
-			}
-
 		case "FILE":
-			// We need to pass the reader to receiveFiles because it has the binary data
-			// However, our loop already read the JSON line. receiveFiles needs to know what it just read.
-			var msg FileHeaderMessage
-			if err := json.Unmarshal(line, &msg); err != nil {
-				continue
-			}
-			receiveOneFile(reader, msg, folder)
+			var msg FileHeader
+			json.Unmarshal(ln, &msg)
+			recvFile(r, msg, fld)
 		}
 	}
 }
 
-func receiveOneFile(reader *bufio.Reader, msg FileHeaderMessage, folder string) {
-	fullPath := filepath.Join(folder, msg.Path)
-	os.MkdirAll(filepath.Dir(fullPath), os.ModePerm)
+func sendFile(c net.Conn, fld string, f indexer.FileMeta) {
+	h, _ := json.Marshal(FileHeader{"FILE", f.RelativePath, f.Size, f.Hash})
+	c.Write(append(h, '\n'))
+	fl, _ := os.Open(filepath.Join(fld, f.RelativePath))
+	defer fl.Close()
+	io.Copy(c, fl)
+}
 
-	logger.Info.Printf("Receiving file: %s (%d bytes)\n", msg.Path, msg.Size)
+func recvFile(r *bufio.Reader, h FileHeader, fld string) {
+	pth := filepath.Join(fld, h.Path)
+	os.MkdirAll(filepath.Dir(pth), os.ModePerm)
+	fl, _ := os.Create(pth)
+	defer fl.Close()
 
-	file, err := os.Create(fullPath)
-	if err != nil {
-		logger.Error.Println("Create failed:", err)
-		io.CopyN(io.Discard, reader, msg.Size)
-		return
-	}
-	defer file.Close()
+	hs := sha256.New()
+	mw := io.MultiWriter(fl, hs)
+	io.CopyN(mw, r, h.Size)
 
-	hasher := sha256.New()
-	multi := io.MultiWriter(file, hasher)
-
-	_, err = io.CopyN(multi, reader, msg.Size)
-	if err != nil {
-		logger.Error.Println("Receive file copy failed:", err)
-		return
-	}
-
-	actualHash := hex.EncodeToString(hasher.Sum(nil))
-	if actualHash != msg.Hash {
-		logger.Error.Printf("Hash mismatch for %s! Expected: %s, Got: %s\n", msg.Path, msg.Hash, actualHash)
-		os.Remove(fullPath)
+	if hex.EncodeToString(hs.Sum(nil)) != h.Hash {
+		os.Remove(pth)
+		logger.Err("Hash fail: %s", h.Path)
 	} else {
-		logger.Info.Printf("Successfully received and verified: %s\n", msg.Path)
+		logger.Done("Got: %s", h.Path)
 	}
 }
 
-func sendMissingFiles(conn net.Conn, folder string, files []indexer.FileMeta) {
-	for _, f := range files {
-		fullPath := filepath.Join(folder, f.RelativePath)
-
-		logger.Info.Printf("Sending file: %s (%d bytes)\n", f.RelativePath, f.Size)
-
-		file, err := os.Open(fullPath)
-		if err != nil {
-			logger.Error.Println("Open failed:", err)
-			continue
-		}
-
-		header, _ := json.Marshal(FileHeaderMessage{
-			Type: "FILE",
-			Path: f.RelativePath,
-			Size: f.Size,
-			Hash: f.Hash,
-		})
-		conn.Write(append(header, '\n'))
-
-		// Send binary data
-		_, err = io.Copy(conn, file)
-		if err != nil {
-			logger.Error.Println("File copy failed:", err)
-		}
-		file.Close()
+func BroadcastReq(h, p string) {
+	b, _ := json.Marshal(ReqMsg{"REQ", h, p})
+	connMu.Lock()
+	for _, c := range conns {
+		c.Write(append(b, '\n'))
 	}
+	connMu.Unlock()
+}
+
+func BroadcastIdx(fld, id string) {
+	idx, _ := indexer.ScanFolder(fld)
+	b, _ := json.Marshal(IndexMsg{"INDEX", id, idx})
+	connMu.Lock()
+	for _, c := range conns {
+		c.Write(append(b, '\n'))
+	}
+	connMu.Unlock()
+}
+
+func BroadcastVote(h, n string) {
+	b, _ := json.Marshal(VoteMsg{"VOTE", h, n})
+	connMu.Lock()
+	for _, c := range conns {
+		c.Write(append(b, '\n'))
+	}
+	connMu.Unlock()
 }
