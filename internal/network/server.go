@@ -3,84 +3,100 @@ package network
 import (
 	"encoding/json"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
+
 	"sync/internal/indexer"
+	"sync/internal/logger"
 	"sync/internal/protocol"
 )
 
 func StartServer(folder string, address string) error {
+	logger.Info.Println("Starting TCP server on", address)
+
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
 
-	log.Println("Listening on", address)
+	logger.Info.Println("Server listening successfully")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("Accept error:", err)
+			logger.Error.Println("Connection accept failed:", err)
 			continue
 		}
 
+		logger.Info.Println("New connection from", conn.RemoteAddr())
 		go handleConnection(conn, folder)
 	}
 }
 
 func handleConnection(conn net.Conn, folder string) {
-	defer conn.Close()
+	defer func() {
+		logger.Info.Println("Closing connection:", conn.RemoteAddr())
+		conn.Close()
+	}()
 
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
 
-	// Receive client index
+	logger.Debug.Println("Waiting for client INDEX message")
+
 	var clientIndex protocol.IndexMessage
 	if err := decoder.Decode(&clientIndex); err != nil {
-		log.Println("Decode error:", err)
+		logger.Error.Println("Failed to decode client index:", err)
 		return
 	}
 
-	// Scan local folder
+	logger.Info.Printf("Received client index: %d files\n", len(clientIndex.Files))
+
+	logger.Debug.Println("Scanning local folder")
 	localFiles, err := indexer.ScanFolder(folder)
 	if err != nil {
-		log.Println("Scan error:", err)
+		logger.Error.Println("Folder scan failed:", err)
 		return
 	}
 
-	// Send server index
-	err = encoder.Encode(protocol.IndexMessage{
+	logger.Info.Printf("Sending server index: %d files\n", len(localFiles))
+	if err := encoder.Encode(protocol.IndexMessage{
 		Type:  "INDEX",
 		Files: localFiles,
-	})
-	if err != nil {
-		log.Println("Encode error:", err)
+	}); err != nil {
+		logger.Error.Println("Failed to send server index:", err)
 		return
 	}
 
-	// Wait for request
+	logger.Debug.Println("Waiting for file REQUEST")
+
 	var request protocol.RequestMessage
 	if err := decoder.Decode(&request); err != nil {
-		log.Println("Request decode error:", err)
+		logger.Error.Println("Failed to decode request:", err)
 		return
 	}
+
+	logger.Info.Printf("Client requested %d files\n", len(request.Hashes))
 
 	for _, hash := range request.Hashes {
 		sendFile(conn, folder, localFiles, hash)
 	}
+
+	logger.Info.Println("All requested files sent successfully")
 }
 
 func sendFile(conn net.Conn, folder string, files []indexer.FileMeta, hash string) {
 	for _, f := range files {
 		if f.Hash == hash {
-			path := filepath.Join(folder, f.RelativePath)
+			fullPath := filepath.Join(folder, f.RelativePath)
 
-			file, err := os.Open(path)
+			logger.Info.Printf("Sending file: %s (%d bytes)\n", f.RelativePath, f.Size)
+
+			file, err := os.Open(fullPath)
 			if err != nil {
-				log.Println("Open file error:", err)
+				logger.Error.Println("Failed to open file:", err)
 				return
 			}
 			defer file.Close()
@@ -95,15 +111,20 @@ func sendFile(conn net.Conn, folder string, files []indexer.FileMeta, hash strin
 			}
 
 			if err := encoder.Encode(header); err != nil {
-				log.Println("Header encode error:", err)
+				logger.Error.Println("Failed to send file header:", err)
 				return
 			}
 
-			if _, err := io.Copy(conn, file); err != nil {
-				log.Println("File send error:", err)
+			written, err := io.Copy(conn, file)
+			if err != nil {
+				logger.Error.Println("File transfer failed:", err)
+				return
 			}
 
+			logger.Debug.Printf("File sent successfully (%d bytes written)\n", written)
 			return
 		}
 	}
+
+	logger.Error.Println("Requested hash not found:", hash)
 }

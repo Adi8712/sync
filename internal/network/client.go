@@ -3,85 +3,100 @@ package network
 import (
 	"encoding/json"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
+
 	"sync/internal/indexer"
-	syncengine "sync/internal/sync"
+	"sync/internal/logger"
 	"sync/internal/protocol"
+	syncengine "sync/internal/sync"
 )
 
 func StartClient(folder string, address string) error {
+	logger.Info.Println("Connecting to server:", address)
+
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() {
+		logger.Info.Println("Closing client connection")
+		conn.Close()
+	}()
+
+	logger.Info.Println("Connected successfully")
 
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
 
-	// Scan local
+	logger.Debug.Println("Scanning local folder")
 	localFiles, err := indexer.ScanFolder(folder)
 	if err != nil {
 		return err
 	}
 
-	// Send index
-	err = encoder.Encode(protocol.IndexMessage{
+	logger.Info.Printf("Local index contains %d files\n", len(localFiles))
+
+	logger.Debug.Println("Sending local INDEX")
+	if err := encoder.Encode(protocol.IndexMessage{
 		Type:  "INDEX",
 		Files: localFiles,
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 
-	// Receive server index
+	logger.Debug.Println("Waiting for server INDEX")
 	var serverIndex protocol.IndexMessage
 	if err := decoder.Decode(&serverIndex); err != nil {
 		return err
 	}
 
-	// Compare
+	logger.Info.Printf("Received server index: %d files\n", len(serverIndex.Files))
+
 	diff := syncengine.Compare(localFiles, serverIndex.Files)
 
-	// Request missing files
+	logger.Info.Printf("Missing files to fetch: %d\n", len(diff.MissingInA))
+	logger.Info.Printf("Conflicts detected: %d\n", len(diff.Conflicts))
+
 	var hashes []string
 	for _, f := range diff.MissingInA {
 		hashes = append(hashes, f.Hash)
 	}
 
-	err = encoder.Encode(protocol.RequestMessage{
+	logger.Debug.Println("Sending REQUEST message")
+	if err := encoder.Encode(protocol.RequestMessage{
 		Type:   "REQUEST",
 		Hashes: hashes,
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 
-	// Receive files
 	for range hashes {
 		var header protocol.FileHeaderMessage
 		if err := decoder.Decode(&header); err != nil {
 			return err
 		}
 
-		path := filepath.Join(folder, header.Path)
-		os.MkdirAll(filepath.Dir(path), os.ModePerm)
+		logger.Info.Printf("Receiving file: %s (%d bytes)\n", header.Path, header.Size)
 
-		file, err := os.Create(path)
+		fullPath := filepath.Join(folder, header.Path)
+		os.MkdirAll(filepath.Dir(fullPath), os.ModePerm)
+
+		file, err := os.Create(fullPath)
 		if err != nil {
 			return err
 		}
 
-		_, err = io.CopyN(file, conn, header.Size)
+		written, err := io.CopyN(file, conn, header.Size)
 		file.Close()
 		if err != nil {
 			return err
 		}
+
+		logger.Debug.Printf("File written successfully (%d bytes)\n", written)
 	}
 
-	log.Println("Sync complete")
+	logger.Info.Println("Synchronization complete")
 	return nil
 }
