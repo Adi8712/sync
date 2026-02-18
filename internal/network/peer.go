@@ -16,7 +16,7 @@ import (
 	"sync/internal/logger"
 )
 
-func StartListener(folder string, address string) error {
+func StartListener(folder string, address string, myDeviceID string, state *NetworkState) error {
 	cert, err := GenerateSelfSignedCert()
 	if err != nil {
 		return err
@@ -38,11 +38,11 @@ func StartListener(folder string, address string) error {
 		}
 
 		logger.Info.Println("Incoming secure connection from", conn.RemoteAddr())
-		go handleConnection(conn, folder)
+		go handleConnection(conn, folder, myDeviceID, state)
 	}
 }
 
-func ConnectToPeer(folder string, address string) error {
+func ConnectToPeer(folder string, address string, myDeviceID string, state *NetworkState) error {
 	cert, err := GenerateSelfSignedCert()
 	if err != nil {
 		return err
@@ -56,103 +56,177 @@ func ConnectToPeer(folder string, address string) error {
 		return err
 	}
 
-	go handleConnection(conn, folder)
+	go handleConnection(conn, folder, myDeviceID, state)
 	return nil
 }
 
-func handleConnection(conn net.Conn, folder string) {
+var (
+	connMu sync.Mutex
+	conns  = make(map[string]net.Conn) // DeviceID -> connection
+)
+
+func registerConn(id string, conn net.Conn) {
+	connMu.Lock()
+	defer connMu.Unlock()
+	conns[id] = conn
+}
+
+func BroadcastFileRequest(hash, path string) {
+	connMu.Lock()
+	defer connMu.Unlock()
+
+	req, _ := json.Marshal(FileRequestMessage{
+		Type: "FILE_REQUEST",
+		Hash: hash,
+		Path: path,
+	})
+
+	for id, conn := range conns {
+		_, err := conn.Write(append(req, '\n'))
+		if err != nil {
+			logger.Error.Printf("Failed to request file from %s: %v\n", id, err)
+		}
+	}
+}
+
+func RenameToConsensus(folder string, state *NetworkState) {
+	localFiles, _ := indexer.ScanFolder(folder)
+	for _, f := range localFiles {
+		winner, ok := state.GetConsensusName(f.Hash)
+		if ok && winner != f.RelativePath {
+			logger.Info.Printf("Renaming local %s to consensus name: %s\n", f.RelativePath, winner)
+			if err := indexer.RenameFile(folder, f.RelativePath, winner); err != nil {
+				logger.Error.Printf("Rename failed for %s -> %s: %v\n", f.RelativePath, winner, err)
+			}
+		}
+	}
+}
+
+func BroadcastConsensusVote(hash, name string) {
+	connMu.Lock()
+	defer connMu.Unlock()
+
+	vote, _ := json.Marshal(ConsensusVoteMessage{
+		Type: "CONSENSUS_VOTE",
+		Hash: hash,
+		Name: name,
+	})
+
+	for _, conn := range conns {
+		conn.Write(append(vote, '\n'))
+	}
+}
+
+func handleConnection(conn net.Conn, folder string, myDeviceID string, state *NetworkState) {
 	defer conn.Close()
 
-	logger.Info.Println("Connection established with", conn.RemoteAddr())
-
-	// Phase 1 — Exchange Index
+	// Immediately send our index
 	localFiles, err := indexer.ScanFolder(folder)
-	if err != nil {
-		logger.Error.Println("Scan failed:", err)
-		return
+	if err == nil {
+		idxMsg, _ := json.Marshal(IndexMessage{
+			Type:     "INDEX",
+			DeviceID: myDeviceID,
+			Files:    localFiles,
+		})
+		conn.Write(append(idxMsg, '\n'))
 	}
-
-	logger.Info.Printf("Sending local index (%d files)\n", len(localFiles))
-	idxMsg, _ := json.Marshal(IndexMessage{
-		Type:  "INDEX",
-		Files: localFiles,
-	})
-	conn.Write(append(idxMsg, '\n'))
 
 	reader := bufio.NewReader(conn)
-	line, err := reader.ReadBytes('\n')
-	if err != nil {
-		logger.Error.Println("Failed reading remote index:", err)
-		return
-	}
-
-	var remoteIndex IndexMessage
-	if err := json.Unmarshal(line, &remoteIndex); err != nil {
-		logger.Error.Println("Failed unmarshaling remote index:", err)
-		return
-	}
-
-	logger.Info.Printf("Received remote index (%d files)\n", len(remoteIndex.Files))
-
-	// Phase 2 — Sync Analysis
-	diff := indexer.Compare(localFiles, remoteIndex.Files)
-
-	// Display Status
-	if len(diff.MissingInA) > 0 {
-		logger.Info.Println("Files to receive from peer:")
-		for _, f := range diff.MissingInA {
-			logger.Info.Printf("  + %s (%d bytes)\n", f.RelativePath, f.Size)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err != io.EOF {
+				logger.Error.Println("Connection error:", err)
+			}
+			return
 		}
-	}
-	if len(diff.MissingInB) > 0 {
-		logger.Info.Println("Files to send to peer:")
-		for _, f := range diff.MissingInB {
-			logger.Info.Printf("  - %s (%d bytes)\n", f.RelativePath, f.Size)
-		}
-	}
 
-	// Phase 3 — Conflict Resolution (Incoming Truth)
-	// If a file exists on both but hashes differ, we rename local and receive remote.
-	for _, c := range diff.Conflicts {
-		localPath := filepath.Join(folder, c.Path)
-		conflictName := localPath + ".conflict"
-
-		logger.Info.Printf("Conflict detected: %s. Renaming local version to %s and accepting remote.\n", c.Path, filepath.Base(conflictName))
-		if err := os.Rename(localPath, conflictName); err != nil {
-			logger.Error.Printf("Failed to rename conflicting file %s: %v\n", c.Path, err)
+		var raw map[string]interface{}
+		if err := json.Unmarshal(line, &raw); err != nil {
 			continue
 		}
 
-		// After renaming local, the remote file is effectively "MissingInA"
-		diff.MissingInA = append(diff.MissingInA, c.B)
-	}
+		switch raw["type"] {
+		case "INDEX":
+			var msg IndexMessage
+			if err := json.Unmarshal(line, &msg); err != nil {
+				continue
+			}
+			state.UpdatePeer(msg.DeviceID, msg.Files)
+			registerConn(msg.DeviceID, conn)
+			logger.Info.Printf("Updated state for peer: %s (%d files)\n", msg.DeviceID, len(msg.Files))
 
-	if len(diff.MissingInA) == 0 && len(diff.MissingInB) == 0 && len(diff.Conflicts) == 0 {
-		logger.Info.Println("All files are up to date.")
+		case "CONSENSUS_VOTE":
+			var msg ConsensusVoteMessage
+			if err := json.Unmarshal(line, &msg); err != nil {
+				continue
+			}
+			state.SetManualConsensus(msg.Hash, msg.Name)
+			logger.Info.Printf("Consensus vote received for %s: %s\n", msg.Hash[:8], msg.Name)
+
+		case "FILE_REQUEST":
+			var msg FileRequestMessage
+			if err := json.Unmarshal(line, &msg); err != nil {
+				continue
+			}
+			logger.Info.Printf("Peer requested file: %s (%s)\n", msg.Path, msg.Hash[:8])
+
+			// Find file by hash locally
+			localFiles, _ := indexer.ScanFolder(folder)
+			var found *indexer.FileMeta
+			for _, f := range localFiles {
+				if f.Hash == msg.Hash {
+					found = &f
+					break
+				}
+			}
+
+			if found != nil {
+				sendMissingFiles(conn, folder, []indexer.FileMeta{*found})
+			}
+
+		case "FILE":
+			// We need to pass the reader to receiveFiles because it has the binary data
+			// However, our loop already read the JSON line. receiveFiles needs to know what it just read.
+			var msg FileHeaderMessage
+			if err := json.Unmarshal(line, &msg); err != nil {
+				continue
+			}
+			receiveOneFile(reader, msg, folder)
+		}
+	}
+}
+
+func receiveOneFile(reader *bufio.Reader, msg FileHeaderMessage, folder string) {
+	fullPath := filepath.Join(folder, msg.Path)
+	os.MkdirAll(filepath.Dir(fullPath), os.ModePerm)
+
+	logger.Info.Printf("Receiving file: %s (%d bytes)\n", msg.Path, msg.Size)
+
+	file, err := os.Create(fullPath)
+	if err != nil {
+		logger.Error.Println("Create failed:", err)
+		io.CopyN(io.Discard, reader, msg.Size)
+		return
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	multi := io.MultiWriter(file, hasher)
+
+	_, err = io.CopyN(multi, reader, msg.Size)
+	if err != nil {
+		logger.Error.Println("Receive file copy failed:", err)
 		return
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Sender
-	go func() {
-		defer wg.Done()
-		sendMissingFiles(conn, folder, diff.MissingInB)
-		doneMsg, _ := json.Marshal(DoneMessage{Type: "DONE"})
-		conn.Write(append(doneMsg, '\n'))
-		logger.Info.Println("Finished sending files")
-	}()
-
-	// Receiver
-	go func() {
-		defer wg.Done()
-		receiveFiles(reader, conn, folder)
-		logger.Info.Println("Finished receiving files")
-	}()
-
-	wg.Wait()
-	logger.Info.Println("Peer synchronization complete")
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if actualHash != msg.Hash {
+		logger.Error.Printf("Hash mismatch for %s! Expected: %s, Got: %s\n", msg.Path, msg.Hash, actualHash)
+		os.Remove(fullPath)
+	} else {
+		logger.Info.Printf("Successfully received and verified: %s\n", msg.Path)
+	}
 }
 
 func sendMissingFiles(conn net.Conn, folder string, files []indexer.FileMeta) {
@@ -181,67 +255,5 @@ func sendMissingFiles(conn net.Conn, folder string, files []indexer.FileMeta) {
 			logger.Error.Println("File copy failed:", err)
 		}
 		file.Close()
-	}
-}
-
-func receiveFiles(reader *bufio.Reader, conn net.Conn, folder string) {
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err != io.EOF {
-				logger.Error.Println("Receive read error:", err)
-			}
-			return
-		}
-
-		var raw map[string]interface{}
-		if err := json.Unmarshal(line, &raw); err != nil {
-			logger.Error.Println("Receive unmarshal error:", err, "Line:", string(line))
-			continue
-		}
-
-		switch raw["type"] {
-		case "FILE":
-			path := raw["path"].(string)
-			size := int64(raw["size"].(float64))
-			expectedHash := raw["hash"].(string)
-
-			fullPath := filepath.Join(folder, path)
-			os.MkdirAll(filepath.Dir(fullPath), os.ModePerm)
-
-			logger.Info.Printf("Receiving file: %s (%d bytes)\n", path, size)
-
-			file, err := os.Create(fullPath)
-			if err != nil {
-				logger.Error.Println("Create failed:", err)
-				// We still need to drain the connection
-				io.CopyN(io.Discard, reader, size)
-				continue
-			}
-
-			// Wrap reader to compute hash while receiving
-			hasher := sha256.New()
-			multi := io.MultiWriter(file, hasher)
-
-			_, err = io.CopyN(multi, reader, size)
-			file.Close()
-
-			if err != nil {
-				logger.Error.Println("Receive file copy failed:", err)
-				continue
-			}
-
-			actualHash := hex.EncodeToString(hasher.Sum(nil))
-			if actualHash != expectedHash {
-				logger.Error.Printf("Hash mismatch for %s! Expected: %s, Got: %s\n", path, expectedHash, actualHash)
-				os.Remove(fullPath) // Remove corrupted file
-			} else {
-				logger.Info.Printf("Successfully received and verified: %s\n", path)
-			}
-
-		case "DONE":
-			logger.Info.Println("Received DONE signal")
-			return
-		}
 	}
 }

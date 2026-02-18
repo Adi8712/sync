@@ -38,7 +38,7 @@ func StartDiscoveryBroadcaster(port string) {
 	}
 }
 
-func DiscoverPeers(onPeerFound func(address string)) {
+func DiscoverPeers(myDeviceID string, onPeerFound func(address string)) {
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", discoveryPort))
 	if err != nil {
 		logger.Error.Println("Discovery listener resolve failed:", err)
@@ -70,7 +70,6 @@ func DiscoverPeers(onPeerFound func(address string)) {
 				peerAddr := fmt.Sprintf("%s:%s", remoteAddr.IP.String(), peerPort)
 
 				if !isLocalIP(remoteAddr.IP) && !discovered[peerAddr] {
-					logger.Info.Println("Discovered new peer:", peerAddr)
 					discovered[peerAddr] = true
 					onPeerFound(peerAddr)
 				}
