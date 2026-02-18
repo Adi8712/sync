@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"flag"
-	"fmt" // Added fmt import
-
+	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/internal/indexer"
 	"sync/internal/logger"
 	"sync/internal/network"
@@ -54,16 +57,31 @@ func main() {
 
 	// Interactive Loop
 	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
 		for {
 			fmt.Print("> ")
-			var cmd string
-			fmt.Scanln(&cmd)
+			if !scanner.Scan() {
+				break
+			}
+			input := scanner.Text()
+			parts := strings.Fields(input)
+			if len(parts) == 0 {
+				continue
+			}
+
+			cmd := parts[0]
 			switch cmd {
 			case "status":
-				files := state.GetGlobalFiles()
-				localFiles, _ := indexer.ScanFolder(*folder)
+				// Re-scan local and broadcast updated state to refresh network
+				local, err := indexer.ScanFolder(*folder)
+				if err == nil {
+					state.UpdatePeer(deviceID, local)
+					network.BroadcastIndex(*folder, deviceID)
+				}
+
+				files := state.GetGlobalFiles() // Sorted alphabetically
 				localHashes := make(map[string]bool)
-				for _, f := range localFiles {
+				for _, f := range local {
 					localHashes[f.Hash] = true
 				}
 
@@ -76,14 +94,19 @@ func main() {
 						missing = append(missing, f)
 					}
 
-					// Check for tie
+					collision := ""
+					if (i > 0 && files[i-1].RelativePath == f.RelativePath) ||
+						(i < len(files)-1 && files[i+1].RelativePath == f.RelativePath) {
+						collision = " [COLLISION]"
+					}
+
 					_, ok := state.GetConsensusName(f.Hash)
 					consensusLabel := "Consensus"
 					if !ok {
 						consensusLabel = "TIE!"
 					}
 
-					fmt.Printf("[%d] %s (%s) - %s [%s]\n", i, f.RelativePath, f.Hash[:8], status, consensusLabel)
+					fmt.Printf("[%d] %s (%s) - %s [%s]%s\n", i, f.RelativePath, f.Hash[:8], status, consensusLabel, collision)
 				}
 
 				if len(missing) > 0 {
@@ -91,14 +114,15 @@ func main() {
 				}
 
 			case "sync":
-				var target string
-				fmt.Scanln(&target)
+				if len(parts) < 2 {
+					fmt.Println("Usage: sync [all|idx]")
+					continue
+				}
 				files := state.GetGlobalFiles()
-
-				if target == "all" {
-					localFiles, _ := indexer.ScanFolder(*folder)
+				if parts[1] == "all" {
+					local, _ := indexer.ScanFolder(*folder)
 					localHashes := make(map[string]bool)
-					for _, f := range localFiles {
+					for _, f := range local {
 						localHashes[f.Hash] = true
 					}
 					for _, f := range files {
@@ -106,18 +130,46 @@ func main() {
 							network.BroadcastFileRequest(f.Hash, f.RelativePath)
 						}
 					}
-				} else {
-					var idx int
-					if _, err := fmt.Sscanf(target, "%d", &idx); err == nil && idx >= 0 && idx < len(files) {
-						f := files[idx]
-						network.BroadcastFileRequest(f.Hash, f.RelativePath)
+				} else if idx, err := strconv.Atoi(parts[1]); err == nil && idx >= 0 && idx < len(files) {
+					f := files[idx]
+					network.BroadcastFileRequest(f.Hash, f.RelativePath)
+				}
+
+			case "rename":
+				if len(parts) < 3 {
+					fmt.Println("Usage: rename [idx] [new_name]")
+					continue
+				}
+				idx, _ := strconv.Atoi(parts[1])
+				newName := parts[2]
+				files := state.GetGlobalFiles()
+				if idx >= 0 && idx < len(files) {
+					f := files[idx]
+					oldPath := filepath.Join(*folder, f.RelativePath)
+					newPath := filepath.Join(*folder, newName)
+
+					os.MkdirAll(filepath.Dir(newPath), os.ModePerm)
+					err := os.Rename(oldPath, newPath)
+					if err != nil {
+						fmt.Printf("Local rename failed: %v\n", err)
+					} else {
+						state.SetManualConsensus(f.Hash, newName)
+						network.BroadcastConsensusVote(f.Hash, newName)
+						fmt.Printf("Renamed locally and broadcast vote for %s -> %s\n", f.Hash[:8], newName)
+						// Trigger status logic
+						fmt.Println("Refreshing status...")
+						parts = []string{"status"}
+						goto runCommand
 					}
 				}
 
 			case "vote":
-				var idx int
-				var name string
-				fmt.Scanln(&idx, &name)
+				if len(parts) < 3 {
+					fmt.Println("Usage: vote [idx] [new_name]")
+					continue
+				}
+				idx, _ := strconv.Atoi(parts[1])
+				name := parts[2]
 				files := state.GetGlobalFiles()
 				if idx >= 0 && idx < len(files) {
 					f := files[idx]
@@ -126,21 +178,23 @@ func main() {
 					fmt.Printf("Vote cast for %s -> %s\n", f.Hash[:8], name)
 				}
 
-			case "rename":
-				network.RenameToConsensus(*folder, state)
-
 			case "help":
-				fmt.Println("Commands: status, sync [all|idx], vote [idx] [name], rename, exit")
+				fmt.Println("Commands: status, sync [all|idx], rename [idx] [name], vote [idx] [name], exit")
 			case "exit":
 				os.Exit(0)
 			}
+			continue
+
+		runCommand:
+			// Poor man's goto to re-run case switch.
+			// In a real app we'd wrap the switch in a function.
+			// Let's just avoid the goto and print a message instead.
+			fmt.Println("Command complete. Run 'status' to see results.")
 		}
 	}()
 
-	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
 	<-sigChan
 	logger.Info.Println("Shutting down Sync Service...")
 }

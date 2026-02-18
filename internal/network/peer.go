@@ -89,6 +89,26 @@ func BroadcastFileRequest(hash, path string) {
 	}
 }
 
+func BroadcastIndex(folder string, myDeviceID string) {
+	localFiles, err := indexer.ScanFolder(folder)
+	if err != nil {
+		logger.Error.Println("Scan failed for broadcast:", err)
+		return
+	}
+
+	idxMsg, _ := json.Marshal(IndexMessage{
+		Type:     "INDEX",
+		DeviceID: myDeviceID,
+		Files:    localFiles,
+	})
+
+	connMu.Lock()
+	defer connMu.Unlock()
+	for _, conn := range conns {
+		conn.Write(append(idxMsg, '\n'))
+	}
+}
+
 func RenameToConsensus(folder string, state *NetworkState) {
 	localFiles, _ := indexer.ScanFolder(folder)
 	for _, f := range localFiles {

@@ -1,6 +1,7 @@
 package network
 
 import (
+	"sort"
 	"sync"
 	"sync/internal/indexer"
 )
@@ -123,5 +124,11 @@ func (s *NetworkState) GetGlobalFiles() []indexer.FileMeta {
 		}
 	nextHash:
 	}
+
+	// Sort results alphabetically by name
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].RelativePath < result[j].RelativePath
+	})
+
 	return result
 }
