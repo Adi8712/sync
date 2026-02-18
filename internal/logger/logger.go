@@ -10,7 +10,18 @@ const (
 	C = "\033[0m"
 )
 
-func Info(f string, a ...any) { fmt.Printf(B+C+f+"\n", a...) }
-func Err(f string, a ...any)  { fmt.Printf(R+C+f+"\n", a...) }
-func Done(f string, a ...any) { fmt.Printf(G+C+f+"\n", a...) }
-func Warn(f string, a ...any) { fmt.Printf(Y+C+f+"\n", a...) }
+func Info(f string, a ...any) {
+	fmt.Printf(B + C + f + "\n", a...)
+}
+
+func Err(f string, a ...any) {
+	fmt.Printf(R + C + f + "\n", a...)
+}
+
+func Done(f string, a ...any) {
+	fmt.Printf(G + C + f + "\n", a...)
+}
+
+func Warn(f string, a ...any) {
+	fmt.Printf(Y + C + f + "\n", a...)
+}

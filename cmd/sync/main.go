@@ -22,7 +22,7 @@ func main() {
 
 	flg()
 	if *fld == "" {
-		logger.Err("Need -folder")
+		logger.Err("Need --folder")
 		os.Exit(1)
 	}
 
@@ -52,52 +52,70 @@ func main() {
 		}
 
 		switch p[0] {
-		case "status":
-			status(*fld, id, st)
-		case "sync":
-			if len(p) < 2 {
-				logger.Warn("sync [all|idx]")
-				continue
-			}
-			files := st.GetGlobal()
-			if p[1] == "all" {
-				local, _ := indexer.ScanFolder(*fld)
-				lh := make(map[string]bool)
-				for _, f := range local {
-					lh[f.Hash] = true
+			case "status":
+				status(*fld, id, st)
+			
+			case "sync":
+				if len(p) < 2 {
+					logger.Warn("sync [all|idx]")
+					continue
 				}
-				for _, f := range files {
-					if !lh[f.Hash] {
-						network.BroadcastReq(f.Hash, f.RelativePath)
+				files := st.GetGlobal()
+				if p[1] == "all" {
+					local, _ := indexer.ScanFolder(*fld)
+					lh := make(map[string]bool)
+					for _, f := range local {
+						lh[f.Hash] = true
+					}
+					for _, f := range files {
+						if !lh[f.Hash] {
+							network.BroadcastReq(f.Hash, f.RelativePath)
+						}
+					}
+				} else if i, _ := strconv.Atoi(p[1]); i >= 0 && i < len(files) {
+					network.BroadcastReq(files[i].Hash, files[i].RelativePath)
+				}
+			
+			case "rename":
+				if len(p) < 3 {
+					logger.Warn("rename [idx] [name]")
+					continue
+				}
+				i, _ := strconv.Atoi(p[1])
+				files := st.GetGlobal()
+				if i >= 0 && i < len(files) {
+					f := files[i]
+					oldP, newP := filepath.Join(*fld, f.RelativePath), filepath.Join(*fld, p[2])
+					os.MkdirAll(filepath.Dir(newP), os.ModePerm)
+					if err := os.Rename(oldP, newP); err == nil {
+						st.SetVote(f.Hash, p[2])
+						network.BroadcastVote(f.Hash, p[2])
+						logger.Done("Renamed: %s", p[2])
+						status(*fld, id, st)
+					} else {
+						logger.Err("Rename fail: %v", err)
 					}
 				}
-			} else if i, _ := strconv.Atoi(p[1]); i >= 0 && i < len(files) {
-				network.BroadcastReq(files[i].Hash, files[i].RelativePath)
-			}
-		case "rename":
-			if len(p) < 3 {
-				logger.Warn("rename [idx] [name]")
-				continue
-			}
-			i, _ := strconv.Atoi(p[1])
-			files := st.GetGlobal()
-			if i >= 0 && i < len(files) {
-				f := files[i]
-				oldP, newP := filepath.Join(*fld, f.RelativePath), filepath.Join(*fld, p[2])
-				os.MkdirAll(filepath.Dir(newP), os.ModePerm)
-				if err := os.Rename(oldP, newP); err == nil {
-					st.SetVote(f.Hash, p[2])
-					network.BroadcastVote(f.Hash, p[2])
-					logger.Done("Renamed: %s", p[2])
-					status(*fld, id, st)
-				} else {
-					logger.Err("Rename fail: %v", err)
+			
+			case "vote":
+				if len(p) < 3 {
+					logger.Warn("vote [idx] [name]")
+					continue
 				}
-			}
-		case "exit":
-			os.Exit(0)
-		default:
-			logger.Warn("status, sync, rename, exit")
+				i, _ := strconv.Atoi(p[1])
+				files := st.GetGlobal()
+				if i >= 0 && i < len(files) {
+					st.SetVote(files[i].Hash, p[2])
+					network.BroadcastVote(files[i].Hash, p[2])
+					logger.Done("Voted: %s", p[2])
+					status(*fld, id, st)
+				}
+			
+			case "exit":
+				os.Exit(0)
+			
+			default:
+				logger.Warn("status, sync, rename, vote, exit")
 		}
 	}
 

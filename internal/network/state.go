@@ -7,7 +7,7 @@ import (
 )
 
 type NetworkState struct {
-	mu sync.RWMutex
+	mu    sync.RWMutex
 	peers map[string][]indexer.FileMeta
 	votes map[string]string
 }
