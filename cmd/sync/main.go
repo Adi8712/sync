@@ -72,46 +72,7 @@ func main() {
 			cmd := parts[0]
 			switch cmd {
 			case "status":
-				// Re-scan local and broadcast updated state to refresh network
-				local, err := indexer.ScanFolder(*folder)
-				if err == nil {
-					state.UpdatePeer(deviceID, local)
-					network.BroadcastIndex(*folder, deviceID)
-				}
-
-				files := state.GetGlobalFiles() // Sorted alphabetically
-				localHashes := make(map[string]bool)
-				for _, f := range local {
-					localHashes[f.Hash] = true
-				}
-
-				fmt.Printf("\n--- Global Network View ---\n")
-				var missing []indexer.FileMeta
-				for i, f := range files {
-					status := "OK"
-					if !localHashes[f.Hash] {
-						status = "MISSING"
-						missing = append(missing, f)
-					}
-
-					collision := ""
-					if (i > 0 && files[i-1].RelativePath == f.RelativePath) ||
-						(i < len(files)-1 && files[i+1].RelativePath == f.RelativePath) {
-						collision = " [COLLISION]"
-					}
-
-					_, ok := state.GetConsensusName(f.Hash)
-					consensusLabel := "Consensus"
-					if !ok {
-						consensusLabel = "TIE!"
-					}
-
-					fmt.Printf("[%d] %s (%s) - %s [%s]%s\n", i, f.RelativePath, f.Hash[:8], status, consensusLabel, collision)
-				}
-
-				if len(missing) > 0 {
-					fmt.Printf("\nYou have %d missing files. Type 'sync all' or 'sync <index>' to download.\n", len(missing))
-				}
+				showStatus(*folder, deviceID, state)
 
 			case "sync":
 				if len(parts) < 2 {
@@ -156,10 +117,7 @@ func main() {
 						state.SetManualConsensus(f.Hash, newName)
 						network.BroadcastConsensusVote(f.Hash, newName)
 						fmt.Printf("Renamed locally and broadcast vote for %s -> %s\n", f.Hash[:8], newName)
-						// Trigger status logic
-						fmt.Println("Refreshing status...")
-						parts = []string{"status"}
-						goto runCommand
+						showStatus(*folder, deviceID, state)
 					}
 				}
 
@@ -176,20 +134,16 @@ func main() {
 					state.SetManualConsensus(f.Hash, name)
 					network.BroadcastConsensusVote(f.Hash, name)
 					fmt.Printf("Vote cast for %s -> %s\n", f.Hash[:8], name)
+					showStatus(*folder, deviceID, state)
 				}
 
 			case "help":
 				fmt.Println("Commands: status, sync [all|idx], rename [idx] [name], vote [idx] [name], exit")
 			case "exit":
 				os.Exit(0)
+			default:
+				fmt.Println("Unknown command. Type 'help' for available commands.")
 			}
-			continue
-
-		runCommand:
-			// Poor man's goto to re-run case switch.
-			// In a real app we'd wrap the switch in a function.
-			// Let's just avoid the goto and print a message instead.
-			fmt.Println("Command complete. Run 'status' to see results.")
 		}
 	}()
 
@@ -197,4 +151,47 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 	logger.Info.Println("Shutting down Sync Service...")
+}
+
+func showStatus(folder, deviceID string, state *network.NetworkState) {
+	// Re-scan local and broadcast updated state
+	local, err := indexer.ScanFolder(folder)
+	if err == nil {
+		state.UpdatePeer(deviceID, local)
+		network.BroadcastIndex(folder, deviceID)
+	}
+
+	files := state.GetGlobalFiles() // Sorted alphabetically
+	localHashes := make(map[string]bool)
+	for _, f := range local {
+		localHashes[f.Hash] = true
+	}
+
+	fmt.Printf("\n--- Global Network View ---\n")
+	var missing []indexer.FileMeta
+	for i, f := range files {
+		status := "OK"
+		if !localHashes[f.Hash] {
+			status = "MISSING"
+			missing = append(missing, f)
+		}
+
+		collision := ""
+		if (i > 0 && files[i-1].RelativePath == f.RelativePath) ||
+			(i < len(files)-1 && files[i+1].RelativePath == f.RelativePath) {
+			collision = " [COLLISION]"
+		}
+
+		_, ok := state.GetConsensusName(f.Hash)
+		consensusLabel := "Consensus"
+		if !ok {
+			consensusLabel = "TIE!"
+		}
+
+		fmt.Printf("[%d] %s (%s) - %s [%s]%s\n", i, f.RelativePath, f.Hash[:8], status, consensusLabel, collision)
+	}
+
+	if len(missing) > 0 {
+		fmt.Printf("\nYou have %d missing files. Type 'sync all' or 'sync <index>' to download.\n", len(missing))
+	}
 }

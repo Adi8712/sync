@@ -9,9 +9,43 @@ import (
 	"encoding/pem"
 	"math/big"
 	"time"
+
+	"sync/internal/indexer"
 )
 
-// GenerateSelfSignedCert creates a basic self-signed certificate for development/LAN use.
+// Messages
+
+type IndexMessage struct {
+	Type     string             `json:"type"`
+	DeviceID string             `json:"device_id"`
+	Files    []indexer.FileMeta `json:"files"`
+}
+
+type FileHeaderMessage struct {
+	Type string `json:"type"`
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+	Hash string `json:"hash"`
+}
+
+type ConsensusVoteMessage struct {
+	Type string `json:"type"`
+	Hash string `json:"hash"`
+	Name string `json:"name"`
+}
+
+type FileRequestMessage struct {
+	Type string `json:"type"`
+	Hash string `json:"hash"`
+	Path string `json:"path"`
+}
+
+type DoneMessage struct {
+	Type string `json:"type"`
+}
+
+// TLS Utilities
+
 func GenerateSelfSignedCert() (tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -43,11 +77,9 @@ func GenerateSelfSignedCert() (tls.Certificate, error) {
 	return tls.X509KeyPair(certPEM, privPEM)
 }
 
-// GetTLSConfig returns a basic TLS configuration that skips verification for self-signed certs.
-// In a true production environment, you would use proper CAs.
 func GetTLSConfig(cert tls.Certificate) *tls.Config {
 	return &tls.Config{
 		Certificates:       []tls.Certificate{cert},
-		InsecureSkipVerify: true, // Needed for self-signed certs in LAN
+		InsecureSkipVerify: true,
 	}
 }

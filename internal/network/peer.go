@@ -109,19 +109,6 @@ func BroadcastIndex(folder string, myDeviceID string) {
 	}
 }
 
-func RenameToConsensus(folder string, state *NetworkState) {
-	localFiles, _ := indexer.ScanFolder(folder)
-	for _, f := range localFiles {
-		winner, ok := state.GetConsensusName(f.Hash)
-		if ok && winner != f.RelativePath {
-			logger.Info.Printf("Renaming local %s to consensus name: %s\n", f.RelativePath, winner)
-			if err := indexer.RenameFile(folder, f.RelativePath, winner); err != nil {
-				logger.Error.Printf("Rename failed for %s -> %s: %v\n", f.RelativePath, winner, err)
-			}
-		}
-	}
-}
-
 func BroadcastConsensusVote(hash, name string) {
 	connMu.Lock()
 	defer connMu.Unlock()
