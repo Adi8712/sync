@@ -27,12 +27,12 @@ func ScanFolder(root string) ([]FileMeta, error) {
 			return nil
 		}
 
-		hash, err := hashFile(path)
+		relPath, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
 
-		relPath, err := filepath.Rel(root, path)
+		hash, err := hashFile(path)
 		if err != nil {
 			return err
 		}

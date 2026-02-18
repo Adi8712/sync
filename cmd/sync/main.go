@@ -2,35 +2,49 @@ package main
 
 import (
 	"flag"
+	"time"
 
+	"os"
+	"os/signal"
 	"sync/internal/logger"
 	"sync/internal/network"
+	"syscall"
 )
 
 func main() {
 	logger.Init()
 
-	mode := flag.String("mode", "", "serve or connect")
 	folder := flag.String("folder", "", "Folder path")
-	address := flag.String("addr", ":9000", "Address")
+	port := flag.String("port", "9000", "Listening port")
+	peer := flag.String("peer", "", "Peer address")
 
 	flag.Parse()
 
-	logger.Info.Println("Sync application starting")
-	logger.Info.Println("Mode:", *mode)
-	logger.Info.Println("Folder:", *folder)
-	logger.Info.Println("Address:", *address)
-
-	switch *mode {
-	case "serve":
-		if err := network.StartServer(*folder, *address); err != nil {
-			logger.Error.Println("Server terminated with error:", err)
-		}
-	case "connect":
-		if err := network.StartClient(*folder, *address); err != nil {
-			logger.Error.Println("Client terminated with error:", err)
-		}
-	default:
-		logger.Error.Println("Invalid mode. Use 'serve' or 'connect'")
+	if *folder == "" {
+		logger.Error.Fatal("Folder path is required")
 	}
+
+	address := ":" + *port
+
+	logger.Info.Printf("Starting Sync Service on port %s for folder: %s\n", *port, *folder)
+
+	go network.StartListener(*folder, address)
+	go network.StartDiscoveryBroadcaster(*port)
+
+	if *peer != "" {
+		time.Sleep(1 * time.Second)
+		network.ConnectToPeer(*folder, *peer)
+	} else {
+		logger.Info.Println("No peer specified. Starting automatic discovery...")
+		go network.DiscoverPeers(func(peerAddr string) {
+			network.ConnectToPeer(*folder, peerAddr)
+		})
+	}
+
+	// Graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	<-sigChan
+	logger.Info.Println("Shutting down Sync Service...")
 }

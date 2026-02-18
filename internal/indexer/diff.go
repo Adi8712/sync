@@ -1,24 +1,22 @@
-package sync
-
-import "sync/internal/indexer"
+package indexer
 
 type DiffResult struct {
-	MissingInA []indexer.FileMeta
-	MissingInB []indexer.FileMeta
+	MissingInA []FileMeta
+	MissingInB []FileMeta
 	Conflicts  []Conflict
 }
 
 type Conflict struct {
 	Path string
-	A    indexer.FileMeta
-	B    indexer.FileMeta
+	A    FileMeta
+	B    FileMeta
 }
 
-func Compare(aFiles, bFiles []indexer.FileMeta) DiffResult {
+func Compare(aFiles, bFiles []FileMeta) DiffResult {
 	result := DiffResult{}
 
-	aMap := make(map[string]indexer.FileMeta)
-	bMap := make(map[string]indexer.FileMeta)
+	aMap := make(map[string]FileMeta)
+	bMap := make(map[string]FileMeta)
 
 	for _, f := range aFiles {
 		aMap[f.RelativePath] = f
