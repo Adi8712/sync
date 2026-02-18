@@ -72,7 +72,7 @@ func handleConnection(conn net.Conn, folder string) {
 		return
 	}
 
-	logger.Info.Printf("Sending INDEX (%d files)\n", len(localFiles))
+	logger.Info.Printf("Sending local index (%d files)\n", len(localFiles))
 	idxMsg, _ := json.Marshal(IndexMessage{
 		Type:  "INDEX",
 		Files: localFiles,
@@ -82,34 +82,54 @@ func handleConnection(conn net.Conn, folder string) {
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
-		logger.Error.Println("Failed reading INDEX:", err)
+		logger.Error.Println("Failed reading remote index:", err)
 		return
 	}
 
 	var remoteIndex IndexMessage
 	if err := json.Unmarshal(line, &remoteIndex); err != nil {
-		logger.Error.Println("Failed unmarshaling INDEX:", err)
+		logger.Error.Println("Failed unmarshaling remote index:", err)
 		return
 	}
 
-	logger.Info.Printf("Received INDEX (%d files)\n", len(remoteIndex.Files))
+	logger.Info.Printf("Received remote index (%d files)\n", len(remoteIndex.Files))
 
-	// Phase 2 — Diff
+	// Phase 2 — Sync Analysis
 	diff := indexer.Compare(localFiles, remoteIndex.Files)
 
-	// Phase 3 — Conflict Resolution
-	for _, c := range diff.Conflicts {
-		conflictPath := filepath.Join(folder, c.Path)
-		newName := conflictPath + ".conflict." + c.A.Hash
-
-		logger.Info.Println("Conflict detected. Renaming:", conflictPath)
-		os.Rename(conflictPath, newName)
+	// Display Status
+	if len(diff.MissingInA) > 0 {
+		logger.Info.Println("Files to receive from peer:")
+		for _, f := range diff.MissingInA {
+			logger.Info.Printf("  + %s (%d bytes)\n", f.RelativePath, f.Size)
+		}
+	}
+	if len(diff.MissingInB) > 0 {
+		logger.Info.Println("Files to send to peer:")
+		for _, f := range diff.MissingInB {
+			logger.Info.Printf("  - %s (%d bytes)\n", f.RelativePath, f.Size)
+		}
 	}
 
-	// Recompute after conflict rename
-	if len(diff.Conflicts) > 0 {
-		localFiles, _ = indexer.ScanFolder(folder)
-		diff = indexer.Compare(localFiles, remoteIndex.Files)
+	// Phase 3 — Conflict Resolution (Incoming Truth)
+	// If a file exists on both but hashes differ, we rename local and receive remote.
+	for _, c := range diff.Conflicts {
+		localPath := filepath.Join(folder, c.Path)
+		conflictName := localPath + ".conflict"
+
+		logger.Info.Printf("Conflict detected: %s. Renaming local version to %s and accepting remote.\n", c.Path, filepath.Base(conflictName))
+		if err := os.Rename(localPath, conflictName); err != nil {
+			logger.Error.Printf("Failed to rename conflicting file %s: %v\n", c.Path, err)
+			continue
+		}
+
+		// After renaming local, the remote file is effectively "MissingInA"
+		diff.MissingInA = append(diff.MissingInA, c.B)
+	}
+
+	if len(diff.MissingInA) == 0 && len(diff.MissingInB) == 0 && len(diff.Conflicts) == 0 {
+		logger.Info.Println("All files are up to date.")
+		return
 	}
 
 	var wg sync.WaitGroup
