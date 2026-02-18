@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"net"
@@ -25,10 +26,11 @@ func StartClient(folder string, address string) error {
 		conn.Close()
 	}()
 
-	logger.Info.Println("Connected successfully")
-
-	decoder := json.NewDecoder(conn)
+	reader := bufio.NewReader(conn)
+	decoder := json.NewDecoder(reader)
 	encoder := json.NewEncoder(conn)
+
+	logger.Info.Println("Connected successfully")
 
 	logger.Debug.Println("Scanning local folder")
 	localFiles, err := indexer.ScanFolder(folder)
@@ -88,7 +90,7 @@ func StartClient(folder string, address string) error {
 			return err
 		}
 
-		written, err := io.CopyN(file, conn, header.Size)
+		written, err := io.CopyN(file, reader, header.Size)
 		file.Close()
 		if err != nil {
 			return err

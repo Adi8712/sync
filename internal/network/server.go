@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"net"
@@ -41,7 +42,8 @@ func handleConnection(conn net.Conn, folder string) {
 		conn.Close()
 	}()
 
-	decoder := json.NewDecoder(conn)
+	reader := bufio.NewReader(conn)
+	decoder := json.NewDecoder(reader)
 	encoder := json.NewEncoder(conn)
 
 	logger.Debug.Println("Waiting for client INDEX message")
@@ -81,13 +83,13 @@ func handleConnection(conn net.Conn, folder string) {
 	logger.Info.Printf("Client requested %d files\n", len(request.Hashes))
 
 	for _, hash := range request.Hashes {
-		sendFile(conn, folder, localFiles, hash)
+		sendFile(conn, encoder, folder, localFiles, hash)
 	}
 
 	logger.Info.Println("All requested files sent successfully")
 }
 
-func sendFile(conn net.Conn, folder string, files []indexer.FileMeta, hash string) {
+func sendFile(conn net.Conn, encoder *json.Encoder, folder string, files []indexer.FileMeta, hash string) {
 	for _, f := range files {
 		if f.Hash == hash {
 			fullPath := filepath.Join(folder, f.RelativePath)
@@ -100,8 +102,6 @@ func sendFile(conn net.Conn, folder string, files []indexer.FileMeta, hash strin
 				return
 			}
 			defer file.Close()
-
-			encoder := json.NewEncoder(conn)
 
 			header := protocol.FileHeaderMessage{
 				Type: "FILE",
