@@ -64,3 +64,19 @@ internal/
 5. Votes are broadcast instantly — all devices see the resolution in real time
 
 Built entirely with the Go standard library. Zero external dependencies.
+
+## Samples
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/d1b50077-a0e8-4079-9216-ecbf1ea68270" width="1000"/><br/>
+      <b>Machine A</b>
+    </td>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/f0ba580d-f141-4939-8b45-c772165969a5" width="1000"/><br/>
+      <b>Machine B</b>
+    </td>
+  </tr>
+</table>
+
